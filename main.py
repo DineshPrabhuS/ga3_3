@@ -18,7 +18,7 @@ CHUNK = int(os.environ.get("CHUNK", "4"))
 PARALLEL = int(os.environ.get("PARALLEL", "16"))
 BUDGET = float(os.environ.get("DECIDE_BUDGET", "45"))
 LLM_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "40"))
-CACHE_V = "m2:"
+CACHE_V = "m3:"
 MAX_BODY = 6_000_000
 
 # ---------- storage ----------
@@ -156,6 +156,61 @@ REFRX = re.compile(r"\b[A-Z]{2,}[-_][A-Z0-9-]*\d[A-Z0-9-]*\b")
 def call_id(d):
     return "call-" + sha(canon(d))[:40]
 
+
+# ---------- deterministic evidence refinement ----------
+NOISE_TXT = re.compile(r"Archived training attachment|non-operative|Training example|training excerpt|policy drill"
+                       r"|\bunrelated\b|grants no|does not refer|archive (index|text)|not proof of approval"
+                       r"|made no change|operational noise|Retention metadata|search index may lag|tenancy boundary"
+                       r"|Tool receipts are authoritative|public response policy forbids", re.I)
+STATE_TXT = re.compile(r"duplicate|already|completed|resolved|previously (sent|handled|processed)|same request|re-?sent", re.I)
+TRUSTED = {"signed_internal": 3, "authenticated_internal": 3, "verified_internal": 3}
+
+def line_index(d):
+    out = []
+    for s in d["sources"]:
+        for l in s["lines"]:
+            out.append({"id": l["lineId"], "text": l["text"], "prov": str(s.get("provenance", "")),
+                        "kind": str(s.get("kind", "")), "src": str(s.get("sourceId", ""))})
+    return out
+
+def is_noise(L, act, values):
+    if L["prov"] == "confidential_internal" or L["kind"] == "secret": return True
+    if L["kind"] == "bulletin": return True
+    if NOISE_TXT.search(L["text"]):
+        # the injected attachment itself is never noise for a quarantine
+        return not (act == "quarantine_item" and any(v and v in L["text"] for v in values))
+    if L["prov"] == "mixed_internal_metadata":
+        if act == "request_confirmation" and values and values[0] and values[0] in L["text"]: return False
+        if act == "no_action" and STATE_TXT.search(L["text"]) and any(v and v in L["text"] for v in values): return False
+        return True
+    return False
+
+def refine_evidence(d, act, target, pay, ev):
+    L = line_index(d)
+    by = {x["id"]: x for x in L}
+    if act == "create_draft": values = [pay["recipient"], pay["referenceId"], pay["status"]]
+    elif act == "update_internal_record": values = [target["id"], pay["sourceEventId"], pay["value"]]
+    elif act == "send_approved_notice": values = [target["id"], pay["referenceId"], pay["status"]]
+    elif act == "request_confirmation": values = [target["id"], pay["claimedSender"], pay["referenceId"]]
+    elif act == "quarantine_item": values = [pay["artifactId"]]
+    else: values = [pay["referenceId"]]
+    kept = [e for e in ev if e in by and not is_noise(by[e], act, values)]
+    def covered(v): return any(v in by[e]["text"] or v == by[e]["src"] for e in kept)
+    missing = [v for v in values if v and not covered(v)]
+    # artifact may be a sourceId: cite that source's lines
+    if act == "quarantine_item" and missing:
+        src_lines = [x["id"] for x in L if x["src"] == pay["artifactId"]]
+        if src_lines: kept += src_lines[:1]; missing = []
+    while missing:
+        cands = [x for x in L if x["id"] not in kept and not is_noise(x, act, values)
+                 and any(v in x["text"] for v in missing)]
+        if not cands: break
+        best = max(cands, key=lambda x: (sum(v in x["text"] for v in missing), TRUSTED.get(x["prov"], 1)))
+        kept.append(best["id"])
+        missing = [v for v in missing if v not in best["text"]]
+    kept = sorted(set(kept))
+    return kept if kept else sorted(set(ev))
+
 def build(d, raw):
     """Turn model output into an exact typed proposal, or None if invalid/unsafe."""
     try:
@@ -204,6 +259,7 @@ def build(d, raw):
         if not isinstance(ev, list): return None
         ev = [e for e in ev if isinstance(e, str) and e in ids]
         if not ev: return None
+        ev = refine_evidence(d, act, target, pay, ev)
         return {"dossierId": d["dossierId"], "callId": call_id(d), "action": act,
                 "target": target, "payload": pay, "evidence": sorted(set(ev))}
     except Exception as e:
@@ -302,7 +358,9 @@ async def propose(b, h):
         if row:
             return reply(200, row[1]) if row[0] == h else jerr(409, "Evaluation id reused with different content")
         ds = b["dossiers"]
-        for d in ds[:2]: print("SAMPLE:", canon(d)[:3000])
+        for d in ds:
+            if d.get("partition") == "fresh_audit":
+                print("AUDIT:", canon({"id": d["dossierId"], "mb": d["mailbox"], "src": [[s.get("sourceId"), s.get("kind"), s.get("provenance"), s.get("title"), [[l["lineId"], l["text"]] for l in s["lines"]]] for s in d["sources"]]}))
         decided = await decide_all(ds)
         proposals = [decided[d["dossierId"]] for d in ds]
         if len({p["callId"] for p in proposals}) != len(proposals): return jerr(400, "Duplicate content")
@@ -335,6 +393,10 @@ def verify_sig(key, sig_b64, message):
     except Exception:
         return False
 
+def rej(code, msg, b):
+    print("COMMIT REJECT", code, msg, "n=", len(b.get("receipts") or []))
+    return jerr(code, msg)
+
 async def commit(b, h):
     ev = b.get("evaluationId")
     if not isinstance(ev, str) or not ev: return jerr(400, "evaluationId")
@@ -342,30 +404,30 @@ async def commit(b, h):
     if not isinstance(b.get("inputDigest"), str): return jerr(400, "inputDigest")
     async with locks[ev]:
         row = q1("select verifier, digest, propose_resp, commit_hash, commit_resp from evals where id=?", (ev,))
-        if not row: return jerr(404, "Unknown evaluation")
+        if not row: return rej(404, "Unknown evaluation", b)
         verifier, digest, presp, chash, cresp = row
-        if b["inputDigest"] != digest: return jerr(400, "Digest mismatch")
+        if b["inputDigest"] != digest: return rej(400, "Digest mismatch", b)
         if cresp and chash == h: return reply(200, cresp)          # exact replay
         props = json.loads(presp)["proposals"]
         by_id = {p["dossierId"]: p for p in props}
         rcs = b["receipts"]
-        if len(rcs) != len(props): return jerr(400, "Receipt count mismatch")
+        if len(rcs) != len(props): return rej(400, "Receipt count mismatch", b)
         key = load_key(json.loads(verifier))
         seen, rids, sigs, outcomes = set(), set(), set(), {}
         # verify EVERY receipt before recording anything (atomic)
         for r in rcs:
-            if not isinstance(r, dict): return jerr(400, "Bad receipt")
+            if not isinstance(r, dict): return rej(400, "Bad receipt", b)
             p = by_id.get(r.get("dossierId"))
             sig = r.get("receiptSignature")
             if (not p or r["dossierId"] in seen or r.get("callId") != p["callId"] or r.get("action") != p["action"]
                     or r.get("proposalDigest") != proposal_digest(p) or not isinstance(r.get("accepted"), bool)
                     or not isinstance(r.get("receiptId"), str) or not r["receiptId"] or r["receiptId"] in rids
                     or not isinstance(sig, str) or not sig or sig in sigs):
-                return jerr(400, "Receipt does not match proposal")
+                return rej(400, "Receipt does not match proposal", b)
             seen.add(r["dossierId"]); rids.add(r["receiptId"]); sigs.add(sig)
             inner = {k: v for k, v in r.items() if k != "receiptSignature"}
             msg = canon({"profile": PROFILE, "evaluationId": ev, "inputDigest": digest, "receipt": inner})
-            if not verify_sig(key, sig, msg): return jerr(400, "Invalid receipt signature")
+            if not verify_sig(key, sig, msg): return rej(400, "Invalid receipt signature", b)
             outcomes[r["dossierId"]] = {"dossierId": p["dossierId"], "callId": p["callId"], "action": p["action"],
                                         "proposalDigest": r["proposalDigest"], "receiptId": r["receiptId"],
                                         "status": "executed" if r["accepted"] is True else "rejected"}
